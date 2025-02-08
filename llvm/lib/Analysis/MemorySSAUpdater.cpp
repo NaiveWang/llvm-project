@@ -37,15 +37,19 @@ using namespace llvm;
 MemoryAccess *MemorySSAUpdater::getPreviousDefIterative(
     BasicBlock *BBB,
     DenseMap<BasicBlock *, TrackingVH<MemoryAccess>> &CachedPreviousDef) {
-  
-  enum State {PRE, POST1, POST2};
 
+  // There're 5 cases, case 3 (easy) and case 5 (hard) has recursives.
+  // We need special states to handle their recursive returns
+  enum State {COMMON, CASE3, CASE5};
+
+  // This is the common frame required for everything
   struct Frame {
     BasicBlock *bb;
     MemoryAccess *rtn;
     State st;
   };
 
+  // This is the additional info only required by Case 5
   struct FrameCase5 {
     SmallVector<TrackingVH<MemoryAccess>, 8> PhiOps;
     bool UniqueIncomingAccess;
@@ -53,14 +57,66 @@ MemoryAccess *MemorySSAUpdater::getPreviousDefIterative(
     pred_iterator PredIt;
   };
 
+  auto Case5AfterLoop = [&](SmallVector<TrackingVH<MemoryAccess>, 8> & PhiOps,
+      bool & UniqueIncomingAccess, MemoryAccess *& SingleAccess,
+      BasicBlock * BB) -> MemoryAccess * {
+    // Now try to simplify the ops to avoid placing a phi.
+    // This may return null if we never created a phi yet, that's okay
+    MemoryPhi *Phi = dyn_cast_or_null<MemoryPhi>(MSSA->getMemoryAccess(BB));
+
+    // See if we can avoid the phi by simplifying it.
+    MemoryAccess *Result = tryRemoveTrivialPhi(Phi, PhiOps);
+    // If we couldn't simplify, we may have to create a phi
+    if (Result == Phi && UniqueIncomingAccess && SingleAccess) {
+      // A concrete Phi only exists if we created an empty one to break a
+      // cycle.
+      if (Phi) {
+        assert(Phi->operands().empty() && "Expected empty Phi");
+        Phi->replaceAllUsesWith(SingleAccess);
+        removeMemoryAccess(Phi);
+      }
+      Result = SingleAccess;
+    } else if (Result == Phi && !(UniqueIncomingAccess && SingleAccess)) {
+      if (!Phi)
+        Phi = MSSA->createMemoryPhi(BB);
+
+      // See if the existing phi operands match what we need.
+      // Unlike normal SSA, we only allow one phi node per block, so we
+      // can't just create a new one.
+      if (Phi->getNumOperands() != 0) {
+        // FIXME: Figure out whether this is dead code and if so remove it.
+        if (!std::equal(Phi->op_begin(), Phi->op_end(), PhiOps.begin())) {
+          // These will have been filled in by the recursive read we did
+          // above.
+          llvm::copy(PhiOps, Phi->op_begin());
+          std::copy(pred_begin(BB), pred_end(BB), Phi->block_begin());
+        }
+      } else {
+        unsigned i = 0;
+        for (auto *Pred : predecessors(BB))
+          Phi->addIncoming(&*PhiOps[i++], Pred);
+        InsertedPHIs.push_back(Phi);
+      }
+      Result = Phi;
+    }
+
+    // Set ourselves up for the next variable by resetting visited state.
+    VisitedBlocks.erase(BB);
+    CachedPreviousDef.insert({BB, Result});
+    return Result;
+  };
+
+  // We may want to switch to vector to boot performance
   std::stack<Frame> sf;
   std::stack<FrameCase5> sf5;
-  sf.push({nullptr, nullptr, PRE});
-  sf.push({BBB, nullptr, PRE});
+  // The return frame
+  sf.push({nullptr, nullptr, COMMON});
+  // The entry frame
+  sf.push({BBB, nullptr, COMMON});
 
   while (sf.size() > 1) {
 
-    if (PRE == sf.top().st) {
+    if (COMMON == sf.top().st) {
       auto BB = sf.top().bb;
       auto Cached = CachedPreviousDef.find(BB);
       if (Cached != CachedPreviousDef.end()) {
@@ -81,8 +137,8 @@ MemoryAccess *MemorySSAUpdater::getPreviousDefIterative(
           CachedPreviousDef.insert({Pred, &*Defs->rbegin()});
           prevDefFromEnd = &*Defs->rbegin();
         } else {
-          sf.top().st = POST1;
-          sf.push({Pred, nullptr, PRE});
+          sf.top().st = CASE3;
+          sf.push({Pred, nullptr, COMMON});
           continue;
         }
         MemoryAccess *Result = prevDefFromEnd;
@@ -119,8 +175,8 @@ MemoryAccess *MemorySSAUpdater::getPreviousDefIterative(
               CachedPreviousDef.insert({Pred, &*Defs->rbegin()});
               prevDefFromEnd = &*Defs->rbegin();
             } else {
-              sf.top().st = POST2;
-              sf.push({Pred, nullptr, PRE});
+              sf.top().st = CASE5;
+              sf.push({Pred, nullptr, COMMON});
               sf5.push({
                   std::move(PhiOps), UniqueIncomingAccess, SingleAccess,
                         std::move(PredIt)
@@ -140,45 +196,8 @@ MemoryAccess *MemorySSAUpdater::getPreviousDefIterative(
         if (halt)
           continue;
 
-        // Now try to simplify the ops to avoid placing a phi.
-        // This may return null if we never created a phi yet, that's okay
-        MemoryPhi *Phi = dyn_cast_or_null<MemoryPhi>(MSSA->getMemoryAccess(BB));
-
-        // See if we can avoid the phi by simplifying it.
-        auto *Result = tryRemoveTrivialPhi(Phi, PhiOps);
-        // If we couldn't simplify, we may have to create a phi
-        if (Result == Phi && UniqueIncomingAccess && SingleAccess) {
-          // A concrete Phi only exists if we created an empty one to break a
-          // cycle.
-          if (Phi) {
-            assert(Phi->operands().empty() && "Expected empty Phi");
-            Phi->replaceAllUsesWith(SingleAccess);
-            removeMemoryAccess(Phi);
-          }
-          Result = SingleAccess;
-        } else if (Result == Phi && !(UniqueIncomingAccess && SingleAccess)) {
-          if (!Phi)
-            Phi = MSSA->createMemoryPhi(BB);
-
-          // See if the existing phi operands match what we need.
-          // Unlike normal SSA, we only allow one phi node per block, so we
-          // can't just create a new one.
-          if (Phi->getNumOperands() != 0) {
-            // FIXME: Figure out whether this is dead code and if so remove it.
-            if (!std::equal(Phi->op_begin(), Phi->op_end(), PhiOps.begin())) {
-              // These will have been filled in by the recursive read we did
-              // above.
-              llvm::copy(PhiOps, Phi->op_begin());
-              std::copy(pred_begin(BB), pred_end(BB), Phi->block_begin());
-            }
-          } else {
-            unsigned i = 0;
-            for (auto *Pred : predecessors(BB))
-              Phi->addIncoming(&*PhiOps[i++], Pred);
-            InsertedPHIs.push_back(Phi);
-          }
-          Result = Phi;
-        }
+        auto Result =
+            Case5AfterLoop(PhiOps, UniqueIncomingAccess, SingleAccess, BB);
 
         // Set ourselves up for the next variable by resetting visited state.
         VisitedBlocks.erase(BB);
@@ -187,14 +206,14 @@ MemoryAccess *MemorySSAUpdater::getPreviousDefIterative(
         sf.top().rtn = Result;
         continue;
       }
-      llvm_unreachable("Should have hit one of the fucking five cases above");
-    } else if (POST1 == sf.top().st) {
+      llvm_unreachable("Should have hit one of the five cases above");
+    } else if (CASE3 == sf.top().st) {
       auto Result = sf.top().rtn;
       CachedPreviousDef.insert({sf.top().bb, Result});
       sf.pop();
       sf.top().rtn = Result;
       continue;
-    } else { // POST2
+    } else { // CASE5
       // recover header
       auto &PhiOps = sf5.top().PhiOps;
       auto &UniqueIncomingAccess = sf5.top().UniqueIncomingAccess;
@@ -221,7 +240,7 @@ MemoryAccess *MemorySSAUpdater::getPreviousDefIterative(
             CachedPreviousDef.insert({Pred, &*Defs->rbegin()});
             prevDefFromEnd = &*Defs->rbegin();
           } else {
-            sf.push({Pred, nullptr, PRE});
+            sf.push({Pred, nullptr, COMMON});
             halt = true;
             break;
           }
@@ -237,54 +256,15 @@ MemoryAccess *MemorySSAUpdater::getPreviousDefIterative(
       if (halt)
         continue;
       // after loop
-      MemoryPhi *Phi = dyn_cast_or_null<MemoryPhi>(MSSA->getMemoryAccess(BB));
-
-      // See if we can avoid the phi by simplifying it.
-      auto *Result = tryRemoveTrivialPhi(Phi, PhiOps);
-      // If we couldn't simplify, we may have to create a phi
-      if (Result == Phi && UniqueIncomingAccess && SingleAccess) {
-        // A concrete Phi only exists if we created an empty one to break a
-        // cycle.
-        if (Phi) {
-          assert(Phi->operands().empty() && "Expected empty Phi");
-          Phi->replaceAllUsesWith(SingleAccess);
-          removeMemoryAccess(Phi);
-        }
-        Result = SingleAccess;
-      } else if (Result == Phi && !(UniqueIncomingAccess && SingleAccess)) {
-        if (!Phi)
-          Phi = MSSA->createMemoryPhi(BB);
-
-        // See if the existing phi operands match what we need.
-        // Unlike normal SSA, we only allow one phi node per block, so we
-        // can't just create a new one.
-        if (Phi->getNumOperands() != 0) {
-          // FIXME: Figure out whether this is dead code and if so remove it.
-          if (!std::equal(Phi->op_begin(), Phi->op_end(), PhiOps.begin())) {
-            // These will have been filled in by the recursive read we did
-            // above.
-            llvm::copy(PhiOps, Phi->op_begin());
-            std::copy(pred_begin(BB), pred_end(BB), Phi->block_begin());
-          }
-        } else {
-          unsigned i = 0;
-          for (auto *Pred : predecessors(BB))
-            Phi->addIncoming(&*PhiOps[i++], Pred);
-          InsertedPHIs.push_back(Phi);
-        }
-        Result = Phi;
-      }
-
-      // Set ourselves up for the next variable by resetting visited state.
-      VisitedBlocks.erase(BB);
-      CachedPreviousDef.insert({BB, Result});
+      auto Result =
+          Case5AfterLoop(PhiOps, UniqueIncomingAccess, SingleAccess, BB);
       sf.pop();
       sf.top().rtn = Result;
       sf5.pop();
       continue;
     }
 
-    llvm_unreachable("Should have hit one of the five fucking cases above");
+    llvm_unreachable("Should have hit one of the three cases above");
   }
   assert(0 == sf5.size());
   return sf.top().rtn;
