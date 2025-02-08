@@ -33,7 +33,7 @@ using namespace llvm;
 // that there are two or more definitions needing to be merged.
 // This still will leave non-minimal form in the case of irreducible control
 // flow, where phi nodes may be in cycles with themselves, but unnecessary.
-MemoryAccess *MemorySSAUpdater::getPreviousDefRecursive(
+MemoryAccess *MemorySSAUpdater::getPreviousDefIterative(
     BasicBlock *BB,
     DenseMap<BasicBlock *, TrackingVH<MemoryAccess>> &CachedPreviousDef) {
   // First, do a cache lookup. Without this cache, certain CFG structures
@@ -49,7 +49,15 @@ MemoryAccess *MemorySSAUpdater::getPreviousDefRecursive(
   if (BasicBlock *Pred = BB->getUniquePredecessor()) {
     VisitedBlocks.insert(BB);
     // Single predecessor case, just recurse, we can only have one definition.
-    MemoryAccess *Result = getPreviousDefFromEnd(Pred, CachedPreviousDef);
+    MemoryAccess *prevDefFromEnd = nullptr;
+    auto *Defs = MSSA->getWritableBlockDefs(Pred);
+    if (Defs) {
+      CachedPreviousDef.insert({Pred, &*Defs->rbegin()});
+      prevDefFromEnd = &*Defs->rbegin();
+    } else {
+      prevDefFromEnd = getPreviousDefIterative(Pred, CachedPreviousDef);
+    }
+    MemoryAccess *Result = prevDefFromEnd;
     CachedPreviousDef.insert({BB, Result});
     return Result;
   }
@@ -74,7 +82,15 @@ MemoryAccess *MemorySSAUpdater::getPreviousDefRecursive(
     MemoryAccess *SingleAccess = nullptr;
     for (auto *Pred : predecessors(BB)) {
       if (MSSA->DT->isReachableFromEntry(Pred)) {
-        auto *IncomingAccess = getPreviousDefFromEnd(Pred, CachedPreviousDef);
+        MemoryAccess *prevDefFromEnd = nullptr;
+        auto *Defs = MSSA->getWritableBlockDefs(Pred);
+        if (Defs) {
+          CachedPreviousDef.insert({Pred, &*Defs->rbegin()});
+          prevDefFromEnd = &*Defs->rbegin();
+        } else {
+          prevDefFromEnd = getPreviousDefIterative(Pred, CachedPreviousDef);
+        }
+        auto *IncomingAccess = prevDefFromEnd;
         if (!SingleAccess)
           SingleAccess = IncomingAccess;
         else if (IncomingAccess != SingleAccess)
@@ -138,7 +154,7 @@ MemoryAccess *MemorySSAUpdater::getPreviousDef(MemoryAccess *MA) {
   if (auto *LocalResult = getPreviousDefInBlock(MA))
     return LocalResult;
   DenseMap<BasicBlock *, TrackingVH<MemoryAccess>> CachedPreviousDef;
-  return getPreviousDefRecursive(MA->getBlock(), CachedPreviousDef);
+  return getPreviousDefIterative(MA->getBlock(), CachedPreviousDef);
 }
 
 // This starts at the memory access, and goes backwards in the block to the find
@@ -168,19 +184,6 @@ MemoryAccess *MemorySSAUpdater::getPreviousDefInBlock(MemoryAccess *MA) {
   return nullptr;
 }
 
-// This starts at the end of block
-MemoryAccess *MemorySSAUpdater::getPreviousDefFromEnd(
-    BasicBlock *BB,
-    DenseMap<BasicBlock *, TrackingVH<MemoryAccess>> &CachedPreviousDef) {
-  auto *Defs = MSSA->getWritableBlockDefs(BB);
-
-  if (Defs) {
-    CachedPreviousDef.insert({BB, &*Defs->rbegin()});
-    return &*Defs->rbegin();
-  }
-
-  return getPreviousDefRecursive(BB, CachedPreviousDef);
-}
 // Recurse over a set of phi uses to eliminate the trivial ones
 MemoryAccess *MemorySSAUpdater::recursePhi(MemoryAccess *Phi) {
   if (!Phi)
@@ -396,7 +399,17 @@ void MemorySSAUpdater::insertDef(MemoryDef *MD, bool RenameUses) {
       auto *BBIDF = MPhi->getBlock();
       for (auto *Pred : predecessors(BBIDF)) {
         DenseMap<BasicBlock *, TrackingVH<MemoryAccess>> CachedPreviousDef;
-        MPhi->addIncoming(getPreviousDefFromEnd(Pred, CachedPreviousDef), Pred);
+        
+        MemoryAccess *prevDefFromEnd = nullptr;
+        auto *Defs = MSSA->getWritableBlockDefs(Pred);
+        if (Defs) {
+          CachedPreviousDef.insert({Pred, &*Defs->rbegin()});
+          prevDefFromEnd = & * Defs->rbegin();
+        } else {
+          prevDefFromEnd = getPreviousDefIterative(Pred, CachedPreviousDef);
+        }
+
+        MPhi->addIncoming(prevDefFromEnd, Pred);
       }
     }
 
